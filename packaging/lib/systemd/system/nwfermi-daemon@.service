@@ -1,0 +1,25 @@
+[Unit]
+Description=NextWindow Fermi daemon for %I
+Documentation=file:///usr/share/doc/nwfermi-daemon-service/README.Debian
+BindsTo=dev-%i.device
+After=dev-%i.device
+ConditionPathExists=/dev/%i
+
+[Service]
+Type=forking
+GuessMainPID=yes
+ExecStartPre=/usr/lib/nwfermi/nwfermi-daemonctl claim %i
+ExecStart=/usr/lib/nwfermi/nwfermi-daemonctl start %i
+ExecStopPost=/usr/lib/nwfermi/nwfermi-daemonctl release %i
+# The proprietary daemon double-forks. Stop every descendant retained in this
+# unit's cgroup instead of guessing a PID in a wrapper.
+KillMode=control-group
+SendSIGKILL=yes
+Restart=no
+TimeoutStartSec=20
+TimeoutStopSec=10
+
+# Activated only by the matching udev rule; administrators must not enable it.
+# One /run/nwfermi/active-board marker permits one SB480 per computer. It is
+# intentionally not a RuntimeDirectory: template instances must never own or
+# remove another instance's global ownership marker.

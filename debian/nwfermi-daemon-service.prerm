@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+  remove|deconfigure)
+    # Stop only units owned by this package; do not touch legacy nwfermi.service.
+    command -v systemctl >/dev/null 2>&1 && systemctl stop 'nwfermi-daemon@*.service' || true
+    ;;
+esac

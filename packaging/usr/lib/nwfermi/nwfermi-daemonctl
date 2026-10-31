@@ -1,0 +1,122 @@
+#!/bin/sh
+set -eu
+
+# Test hooks default to the package paths, permitting lifecycle tests without
+# a real /dev node or proprietary daemon.
+CONFIG=${NWFERMI_CONFIG:-/etc/nwfermi/daemon.conf}
+DEV_DIR=${NWFERMI_DEV_DIR:-/dev}
+STATE_DIR=${NWFERMI_STATE_DIR:-/run/nwfermi}
+READELF=${NWFERMI_READELF:-readelf}
+LDD=${NWFERMI_LDD:-ldd}
+I386_LOADER=${NWFERMI_I386_LOADER:-/lib/ld-linux.so.2}
+
+fail() {
+  echo "nwfermi-daemonctl: $*" >&2
+  exit 1
+}
+
+parse_node() {
+  node=${1:-}
+  case "$node" in
+    nwfermi*) instance=${node#nwfermi} ;;
+    *) fail "expected a nwfermiN instance, got: $node" ;;
+  esac
+  case "$instance" in
+    ''|*[!0-9]*) fail "expected digits after nwfermi, got: $node" ;;
+  esac
+}
+
+active_dir() {
+  printf '%s/active-board\n' "$STATE_DIR"
+}
+
+claim() {
+  active=$(active_dir)
+  mkdir -p "$STATE_DIR"
+  if mkdir "$active" 2>/dev/null; then
+    printf '%s\n' "$node" > "$active/node"
+    echo "nwfermi-daemonctl: claimed SB480 node $node" >&2
+    return 0
+  fi
+  owner=$(sed -n '1p' "$active/node" 2>/dev/null || true)
+  [ -n "$owner" ] && fail "SB480 node $owner is already managed; refusing a second board ($node)"
+  fail "an incomplete SB480 ownership marker exists at $active; inspect it before retrying"
+}
+
+release() {
+  active=$(active_dir)
+  owner=$(sed -n '1p' "$active/node" 2>/dev/null || true)
+  if [ "$owner" = "$node" ]; then
+    rm -f "$active/started"
+    rm -f "$active/node"
+    rmdir "$active" 2>/dev/null || true
+    echo "nwfermi-daemonctl: released SB480 node $node" >&2
+  fi
+}
+
+require_claim() {
+  active=$(active_dir)
+  owner=$(sed -n '1p' "$active/node" 2>/dev/null || true)
+  [ "$owner" = "$node" ] || fail "node $node has no active ownership claim"
+}
+
+load_configuration() {
+  [ -r "$CONFIG" ] || fail "missing $CONFIG"
+  . "$CONFIG"
+  [ -n "${DAEMON:-}" ] || fail "DAEMON is not configured"
+  [ -x "$DAEMON" ] || fail "proprietary daemon is not executable: $DAEMON"
+}
+
+require_i386_runtime() {
+  command -v "$READELF" >/dev/null 2>&1 || fail "readelf is required to validate the proprietary daemon"
+  elf_header=$(LC_ALL=C "$READELF" -h "$DAEMON" 2>&1) || fail "readelf could not inspect daemon $DAEMON: $elf_header"
+  printf '%s\n' "$elf_header" | grep -Eq '^[[:space:]]*Class:[[:space:]]*ELF32([[:space:]]|$)' || fail "daemon is not an ELF32/i386 executable (readelf Class: $(printf '%s\n' "$elf_header" | sed -n 's/^[[:space:]]*Class:[[:space:]]*//p' | sed -n '1p'))"
+  elf_program_headers=$(LC_ALL=C "$READELF" -l "$DAEMON" 2>&1) || fail "readelf could not inspect daemon interpreter $DAEMON: $elf_program_headers"
+  printf '%s\n' "$elf_program_headers" | grep -Fq 'Requesting program interpreter: /lib/ld-linux.so.2' || fail "daemon does not request the expected i386 loader"
+  [ -e "$I386_LOADER" ] || fail "missing i386 loader $I386_LOADER; install the appropriate 32-bit libc runtime"
+  command -v "$LDD" >/dev/null 2>&1 || fail "ldd is required to validate daemon libraries"
+  ldd_output=$(LC_ALL=C "$LDD" "$DAEMON" 2>&1) || true
+  if printf '%s\n' "$ldd_output" | grep -q 'not found'; then
+    fail "a required i386 daemon library is missing: $ldd_output"
+  fi
+  if printf '%s\n' "$ldd_output" | grep -Eq 'not a dynamic executable|Bad system call'; then
+    fail "cannot validate the i386 runtime with ldd: $ldd_output"
+  fi
+}
+
+case ${1:-} in
+  claim)
+    parse_node "${2:-}"
+    claim
+    ;;
+  start)
+    parse_node "${2:-}"
+    require_claim
+    [ -e "$DEV_DIR/$node" ] || fail "$DEV_DIR/$node is unavailable"
+    load_configuration
+    require_i386_runtime
+    active=$(active_dir)
+    if [ -e "$active/started" ]; then
+      echo "nwfermi-daemonctl: daemon for $node was already started" >&2
+      exit 0
+    fi
+    printf '%s\n' "$node" > "$active/started"
+    exec "$DAEMON" /daemon /instanceId "$instance"
+    ;;
+  check)
+    load_configuration
+    require_i386_runtime
+    echo "nwfermi-daemonctl: daemon preflight passed for $DAEMON" >&2
+    ;;
+  stop)
+    parse_node "${2:-}"
+    # systemd terminates this unit's cgroup. Never scan /proc or signal a
+    # guessed PID; this is safe after unplug or configuration removal.
+    echo "nwfermi-daemonctl: stop for $node is managed by systemd cgroup" >&2
+    ;;
+  release)
+    parse_node "${2:-}"
+    release
+    ;;
+  *) fail "usage: $0 {claim|start|stop|release} nwfermiN | check" ;;
+esac

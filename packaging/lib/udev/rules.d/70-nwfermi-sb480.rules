@@ -1,0 +1,8 @@
+# SMART Board SB480 / NextWindow Fermi (USB 0b8c:0090).
+# The nw-fermi USB class device is named nwfermiN and is exposed in the
+# usbmisc subsystem. Start an instance whose ID comes from N, rather than
+# assuming a particular USB enumeration order.
+# SYSTEMD_WANTS starts only on add. The remove rule still tags the device so
+# systemd receives the removal and BindsTo=dev-%i.device stops the unit.
+ACTION=="add", SUBSYSTEM=="usbmisc", KERNEL=="nwfermi[0-9]*", ATTRS{idVendor}=="0b8c", ATTRS{idProduct}=="0090", TAG+="systemd", ENV{SYSTEMD_WANTS}+="nwfermi-daemon@%k.service", SYMLINK+="nw-fermi-sb480-%k"
+ACTION=="remove", SUBSYSTEM=="usbmisc", KERNEL=="nwfermi[0-9]*", ATTRS{idVendor}=="0b8c", ATTRS{idProduct}=="0090", TAG+="systemd"

@@ -1,0 +1,28 @@
+The NextWindow daemon is proprietary and is not part of this package. The
+packaging supports exactly one SMART Board SB480 per computer in this release.
+
+Before attaching the board, copy the original i386 nwfermi_daemon to
+/usr/local/sbin/nwfermi_daemon, make it executable, and review
+/etc/nwfermi/daemon.conf. Another location is supported by changing DAEMON in
+that configuration file; a symbolic link is unnecessary. Do not run the
+legacy nwfermi.service at the same time as this udev-activated integration.
+
+The udev rule matches only USB vendor/product 0b8c:0090 and starts the
+nwfermi-daemon@nwfermiN.service instance. N is derived from the actual device
+node and is passed to the daemon as /instanceId N; it is never derived from
+the USB interface minor. A second board is rejected by an atomic runtime
+ownership marker and does not stop or replace the first daemon.
+
+The daemon payload supplied with this project is ELF32/i386. The service checks
+its ELF class, interpreter `/lib/ld-linux.so.2`, and `ldd` output before it is
+started. Install a suitable 32-bit libc runtime (normally `libc6-i386` or
+`libc6:i386`, depending on local Ubuntu policy) before connecting the board.
+Run `nwfermi-daemonctl check` after configuring DAEMON to perform the same
+preflight without starting the daemon.
+
+The daemon double-forks. systemd therefore owns termination through the unit
+cgroup (`KillMode=control-group`); the wrapper never guesses a PID from
+`/proc`. `SYSTEMD_WANTS` is used only for the add event. A separate remove
+rule lets the `BindsTo=dev-%i.device` dependency stop the unit on unplug.
+Correct retention of the daemon child in that cgroup must still be verified
+with the physical board.

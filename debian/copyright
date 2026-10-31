@@ -1,0 +1,16 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: nwfermi
+Source: https://github.com/DadaMonad/nwfermi
+
+Files: nwfermi-0.6.5.0/*
+Copyright: see upstream source files
+License: GPL-2
+
+Files: debian/* packaging/* docs/* tests/*
+Copyright: 2026 SMART Board Linux Recovery Project
+License: GPL-2
+
+License: GPL-2
+ This package is distributed under the GNU General Public License,
+ version 2. On Debian systems the complete text is available in
+ /usr/share/common-licenses/GPL-2.

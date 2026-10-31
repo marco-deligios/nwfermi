@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+  configure)
+    # autoinstall only builds modules that are already registered in the
+    # DKMS tree.  A newly installed /usr/src/nw-fermi-* directory is not
+    # registered automatically, so add it first.
+    # The USB teardown fix has a new DKMS version.  Remove the superseded
+    # registration left by package upgrades; this does not unload a module.
+    dkms remove -m nw-fermi -v 0.6.5.0 --all || true
+    if ! dkms status -m nw-fermi -v 0.6.5.1 2>/dev/null | grep -q '^nw-fermi/0\.6\.5\.1'; then
+      dkms add -m nw-fermi -v 0.6.5.1
+    fi
+    dkms autoinstall -m nw-fermi -v 0.6.5.1
+    ;;
+esac

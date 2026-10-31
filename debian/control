@@ -1,0 +1,25 @@
+Source: nw-fermi-sb480
+Section: kernel
+Priority: optional
+Maintainer: SMART Board Linux Recovery Project <smartboard-linux@example.org>
+Build-Depends: debhelper-compat (= 13), dkms
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: nw-fermi-dkms
+Architecture: all
+Depends: dkms (>= 2.8.4), ${misc:Depends}
+Description: DKMS source for the NextWindow Fermi input module
+ Builds the free, out-of-tree nw-fermi USB input module for every installed
+ kernel that has matching headers. It contains no SMART or NextWindow binary.
+
+Package: nwfermi-daemon-service
+Architecture: all
+Depends: ${misc:Depends}, binutils, kmod, udev
+Recommends: nw-fermi-dkms
+Description: udev and systemd integration for a user-supplied NextWindow daemon
+ Starts one NextWindow daemon for the single supported SMART Board SB480.
+ A second compatible board is rejected deterministically and does not start
+ another daemon.
+ The proprietary daemon is deliberately not shipped: the administrator must
+ install an original copy at the configured path.
