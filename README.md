@@ -1,6 +1,22 @@
 nwfermi
 =======
 
+## SMART Board SB480 su Ubuntu
+
+Questo repository include una proposta di distribuzione Debian non invasiva:
+
+- `nw-fermi-dkms` costruisce il modulo per i kernel dotati dei relativi header;
+- `nwfermi-daemon-service` usa udev e un servizio template, senza fissare
+  `/dev/nwfermi2`;
+- il daemon NextWindow, i driver SMART, Notebook e firmware non sono inclusi
+  né redistribuiti. L'amministratore deve fornire il daemon originale
+  separatamente.
+
+Consultare `docs/ARCHITETTURA_DISTRIBUZIONE.md`,
+`docs/INSTALLAZIONE_E_COLLAUDO.md` e `docs/PIANO_TEST_HARDWARE.md`. Non
+installare questi file direttamente sul sistema di sviluppo durante l'analisi:
+costruire e collaudare i `.deb` su un sistema autorizzato con la lavagna.
+
 nwfermi is a input driver for NextWindow touchscreens. I just bought a new pc and I intend provide a working version of its touchscreen driver..
 
 ## Installation

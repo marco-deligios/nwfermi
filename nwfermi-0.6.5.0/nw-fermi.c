@@ -22,9 +22,11 @@
 #include <linux/usb.h>
 #include <linux/mutex.h>
 #include <linux/input.h>
+#include <linux/input/mt.h>
 #include <linux/kfifo.h>
 #include <linux/vmalloc.h>
 #include <linux/version.h>
+#include <linux/wait.h>
 
 /* Helper defines */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,30)
@@ -49,8 +51,11 @@
 #define NW1950_MAX_H 32767
 #define NW1950_DEFAULT_H 1000
 
+#define FERMI_MAX_TOUCHES 2
+
 /* table of devices that work with this driver */
 static struct usb_device_id fermi_table [] = {
+	{ USB_DEVICE(0x0b8c, 0x0090) }, /* SMART Board SB480 */
 	/* 1950 devices */
 	{ USB_DEVICE(0x1926, 0x0006) },
 	{ USB_DEVICE(0x1926, 0x007B) },
@@ -222,11 +227,14 @@ struct usb_fermi {
 	int			open_count;		/* count the number of openers */
 	spinlock_t		err_lock;		/* lock for errors */
 	spinlock_t		bulk_lock;		/* lock for bulk fifo */
+	spinlock_t		urb_lock;		/* serializes stop against bulk URB submit */
 	struct kref		kref;
 	struct mutex		io_mutex;		/* synchronize I/O with disconnect */
 	struct input_dev*	input_dev;		/* the input device (to control cursor) */
 	bool			input_dev_registered;	/* did we manage to register the input device */
-	struct completion       bulk_in_completion;     /* to wait for bulk usb data */
+	wait_queue_head_t	bulk_in_wait;		/* bulk data, error, or disconnect */
+	bool			disconnected;
+	bool			bulk_stopping;
 };
 #define to_fermi_dev(d) container_of(d, struct usb_fermi, kref)
 
@@ -253,6 +261,94 @@ static void fermi_delete(struct kref *kref)
 	if (dev->bulk_interim_buf)
 		vfree(dev->bulk_interim_buf);
 	kfree(dev);
+}
+
+static void fermi_set_error(struct usb_fermi *dev, int error)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->err_lock, flags);
+	/* Do not hide a final disconnect behind a less useful transport error. */
+	if (!dev->errors || error == -ENODEV)
+		dev->errors = error;
+	spin_unlock_irqrestore(&dev->err_lock, flags);
+}
+
+static int fermi_take_error(struct usb_fermi *dev)
+{
+	unsigned long flags;
+	int error;
+
+	spin_lock_irqsave(&dev->err_lock, flags);
+	error = dev->errors;
+	dev->errors = 0;
+	spin_unlock_irqrestore(&dev->err_lock, flags);
+	return error;
+}
+
+static bool fermi_fifo_has_data(struct usb_fermi *dev)
+{
+	unsigned long flags;
+	bool available;
+
+	spin_lock_irqsave(&dev->bulk_lock, flags);
+	available = !kfifo_is_empty(&dev->bulk_fifo);
+	spin_unlock_irqrestore(&dev->bulk_lock, flags);
+	return available;
+}
+
+static bool fermi_read_ready(struct usb_fermi *dev)
+{
+	unsigned long flags;
+	bool ready;
+
+	if (READ_ONCE(dev->disconnected) || fermi_fifo_has_data(dev))
+		return true;
+
+	spin_lock_irqsave(&dev->err_lock, flags);
+	ready = dev->errors != 0;
+	spin_unlock_irqrestore(&dev->err_lock, flags);
+	return ready;
+}
+
+/*
+ * The completion handler runs in atomic context.  Holding urb_lock across
+ * usb_submit_urb(GFP_ATOMIC) makes setting bulk_stopping and queuing a new
+ * URB one operation with respect to disconnect/kill_anchored_urbs.
+ */
+static int fermi_submit_bulk_urb(struct usb_fermi *dev, struct urb *urb)
+{
+	unsigned long flags;
+	int retval;
+
+	spin_lock_irqsave(&dev->urb_lock, flags);
+	if (dev->disconnected || dev->bulk_stopping) {
+		retval = -ENODEV;
+		goto out_unlock;
+	}
+
+	usb_anchor_urb(urb, &dev->submitted);
+	retval = usb_submit_urb(urb, GFP_ATOMIC);
+	if (retval)
+		usb_unanchor_urb(urb);
+
+out_unlock:
+	spin_unlock_irqrestore(&dev->urb_lock, flags);
+	return retval;
+}
+
+static void fermi_stop_bulk_reads(struct usb_fermi *dev, int error)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->urb_lock, flags);
+	WRITE_ONCE(dev->bulk_stopping, true);
+	spin_unlock_irqrestore(&dev->urb_lock, flags);
+
+	/* This waits for every anchored completion handler to return. */
+	usb_kill_anchored_urbs(&dev->submitted);
+	fermi_set_error(dev, error);
+	wake_up_interruptible_all(&dev->bulk_in_wait);
 }
 
 static int fermi_open(struct inode *inode, struct file *file)
@@ -285,8 +381,16 @@ static int fermi_open(struct inode *inode, struct file *file)
 	 * in resumption */
 	mutex_lock(&dev->io_mutex);
 
+	/* disconnect may have run after usb_find_interface() returned. */
+	if (!dev->interface || READ_ONCE(dev->disconnected)) {
+		retval = -ENODEV;
+		mutex_unlock(&dev->io_mutex);
+		kref_put(&dev->kref, fermi_delete);
+		goto exit;
+	}
+
 	if (!dev->open_count++) {
-		retval = usb_autopm_get_interface(interface);
+		retval = usb_autopm_get_interface(dev->interface);
 			if (retval) {
 				dev->open_count--;
 				mutex_unlock(&dev->io_mutex);
@@ -360,8 +464,15 @@ static ssize_t fermi_read(struct file *file, char *buffer, size_t count, loff_t 
 
 	dev = (struct usb_fermi *)file->private_data;
 
-	while (retval == 0)
-	{
+	for (;;) {
+		/* A disconnect is terminal even if data was queued just before it. */
+		if (READ_ONCE(dev->disconnected))
+			return -ENODEV;
+
+		retval = fermi_take_error(dev);
+		if (retval)
+			return retval;
+
 		mutex_lock(&dev->io_mutex);
 		if (!dev->interface) {		/* disconnect() was called */
 			retval = -ENODEV;
@@ -386,26 +497,21 @@ static ssize_t fermi_read(struct file *file, char *buffer, size_t count, loff_t 
 					printk("copy_to_user err!\n");
 				}
 			}
-			else if (retval == 0)
-			{
-				mutex_unlock(&dev->io_mutex);
-
-				/*
-				 * IO may take forever
-				 * hence wait in an interruptible state
-				 */
-				init_completion(&dev->bulk_in_completion);
-				retval = wait_for_completion_interruptible(&dev->bulk_in_completion);
-
-				continue;
-			}
 		}
 
 		mutex_unlock(&dev->io_mutex);
-	}
+		if (retval)
+			return retval;
 
-	//printk("fermi_read return code: %d\n", retval);
-	return retval;
+		/*
+		 * All predicates are persistent state guarded by their own locks.  This
+		 * closes the old unlock/init_completion lost-wakeup window.
+		 */
+		retval = wait_event_interruptible(dev->bulk_in_wait,
+						 fermi_read_ready(dev));
+		if (retval)
+			return retval;
+	}
 }
 
 #include "nwfermi_public.h"
@@ -414,32 +520,53 @@ static void fermi_input_event(struct usb_fermi *dev, struct fermi_touch_report_t
 {
 #ifdef MULTITOUCH
 	int i;
-	int count = min(touch_report->count, (unsigned char)2);
-	// multitouch
-	for (i = 0; i < count; i++)
-	{
-		input_report_abs(dev->input_dev, ABS_MT_TRACKING_ID, touch_report->touch[i].id);
-		input_report_abs(dev->input_dev, ABS_MT_POSITION_X, touch_report->touch[i].x);
-		input_report_abs(dev->input_dev, ABS_MT_POSITION_Y, touch_report->touch[i].y);
-		// we just set width and height to 1 now for android 2.x as it seems to need it
+	int slot;
+	int count = min(touch_report->count, (unsigned char)FERMI_MAX_TOUCHES);
+	bool primary_active = false;
+	int primary_x = 0;
+	int primary_y = 0;
+
+	/*
+	 * The daemon sends a complete frame of up to two contacts.  Emit the
+	 * current input protocol (MT Type B): a slot is keyed by the daemon's
+	 * stable contact id and an UP record explicitly makes that slot inactive.
+	 * Reporting an UP record as a normal Type A contact kept its tracking id
+	 * alive and is the source of libinput's duplicate-tracking-id diagnostics.
+	 */
+	for (i = 0; i < count; i++) {
+		struct fermi_touch_t *touch = &touch_report->touch[i];
+		bool active = touch->state == FERMI_TOUCH_DOWN ||
+			      touch->state == FERMI_TOUCH;
+
+		slot = input_mt_get_slot_by_key(dev->input_dev, touch->id);
+		if (slot < 0)
+			continue;
+
+		input_mt_slot(dev->input_dev, slot);
+		input_mt_report_slot_state(dev->input_dev, MT_TOOL_FINGER, active);
+		if (!active)
+			continue;
+
+		input_report_abs(dev->input_dev, ABS_MT_POSITION_X, touch->x);
+		input_report_abs(dev->input_dev, ABS_MT_POSITION_Y, touch->y);
 		input_report_abs(dev->input_dev, ABS_MT_TOUCH_MAJOR, NW1950_DEFAULT_W);
 		input_report_abs(dev->input_dev, ABS_MT_TOUCH_MINOR, NW1950_DEFAULT_H);
-		input_mt_sync(dev->input_dev);
+
+		if (!primary_active) {
+			primary_active = true;
+			primary_x = touch->x;
+			primary_y = touch->y;
+		}
 	}
+	/* INPUT_MT_DROP_UNUSED releases slots absent from this complete frame. */
+	input_mt_sync_frame(dev->input_dev);
 #endif
-	// mouse
-	if (touch_report->touch[0].state == FERMI_TOUCH_DOWN ||
-		touch_report->touch[0].state == FERMI_TOUCH ||
-		touch_report->touch[0].state == FERMI_TOUCH_UP ||
-		touch_report->touch[0].state == FERMI_TOUCH_HOVER)
-	{
-		input_report_key(dev->input_dev, BTN_LEFT, touch_report->touch[0].state == FERMI_TOUCH_UP ? 0 : 1);
-		input_report_abs(dev->input_dev, ABS_X, touch_report->touch[0].x);
-		input_report_abs(dev->input_dev, ABS_Y, touch_report->touch[0].y);
+	input_report_key(dev->input_dev, BTN_TOUCH, primary_active);
+	if (primary_active) {
+		input_report_abs(dev->input_dev, ABS_X, primary_x);
+		input_report_abs(dev->input_dev, ABS_Y, primary_y);
 	}
-	// sync
 	input_sync(dev->input_dev);
-	//printk("fermi_write BTN_LEFT: %d, BTN_RIGHT: %d, ABS_X: %d, ABS_Y: %d\n", button & 1, button & 2, x , y);
 }
 
 static ssize_t fermi_write(struct file *file, const char *user_buffer,
@@ -451,8 +578,6 @@ static ssize_t fermi_write(struct file *file, const char *user_buffer,
 
 	dev = (struct usb_fermi *)file->private_data;
 
-	/**@todo do we need to sync this using a mutex lock ? */
-
 	/* get the user data */
 	buf = kzalloc(count, GFP_KERNEL);
 	if (!buf)
@@ -463,11 +588,18 @@ static ssize_t fermi_write(struct file *file, const char *user_buffer,
 		goto end;
 	}
 
-	/* fire data to input subsystem */ 
-	if (count >= sizeof(struct fermi_touch_report_t))
-	{
-		fermi_input_event(dev, (struct fermi_touch_report_t*)buf);
+	/* Keep input_dev alive and reject daemon output after disconnect. */
+	mutex_lock(&dev->io_mutex);
+	if (!dev->interface) {
+		retval = -ENODEV;
+		mutex_unlock(&dev->io_mutex);
+		goto end;
 	}
+
+	/* fire data to input subsystem */
+	if (count >= sizeof(struct fermi_touch_report_t))
+		fermi_input_event(dev, (struct fermi_touch_report_t*)buf);
+	mutex_unlock(&dev->io_mutex);
 	retval = count;
 
 end:
@@ -522,7 +654,7 @@ static void fermi_bulk_read_complete(struct urb* urb)
 		}
 	}
 	else {
-		if (!dev->interface) {		/* disconnect() was called */
+		if (READ_ONCE(dev->disconnected) || READ_ONCE(dev->bulk_stopping)) {
 			retval = -ENODEV;
 		}
 		else {
@@ -534,8 +666,8 @@ static void fermi_bulk_read_complete(struct urb* urb)
 			kfifo_put(dev->bulk_fifo, urb->transfer_buffer, urb->actual_length);
 #endif
 
-			/* wake up the fops read thread */
-			complete(&dev->bulk_in_completion);
+			/* Wake readers after making FIFO state visible. */
+			wake_up_interruptible(&dev->bulk_in_wait);
 
 			/* re-initialize the urb */
 			usb_fill_bulk_urb(urb, dev->udev,
@@ -544,13 +676,15 @@ static void fermi_bulk_read_complete(struct urb* urb)
 					fermi_bulk_read_complete, dev);
 			urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 
-			/* resumbit the urb */
-			retval = usb_submit_urb(urb, GFP_ATOMIC);
+			/* Re-anchor every submission: completion ends an association. */
+			retval = fermi_submit_bulk_urb(dev, urb);
 		}
 	}
 
 	if (retval)
 	{
+		fermi_set_error(dev, retval);
+		wake_up_interruptible_all(&dev->bulk_in_wait);
 		/* free resources */
 #ifdef NEW_USB_ALLOC
 		usb_free_coherent(dev->udev, urb->transfer_buffer_length, urb->transfer_buffer, urb->transfer_dma);
@@ -567,6 +701,19 @@ static int fermi_start_bulk_reads(struct usb_fermi* dev)
 	struct urb* urb=NULL;		
 	char* buf = NULL;
 	
+	/* A successful restart is allowed only while the interface is live. */
+	{
+		unsigned long flags;
+
+		spin_lock_irqsave(&dev->urb_lock, flags);
+		if (dev->disconnected) {
+			spin_unlock_irqrestore(&dev->urb_lock, flags);
+			return -ENODEV;
+		}
+		WRITE_ONCE(dev->bulk_stopping, false);
+		spin_unlock_irqrestore(&dev->urb_lock, flags);
+	}
+
 	/* create an URB */
 	urb = usb_alloc_urb(0, GFP_KERNEL);
 	if (!urb)
@@ -586,10 +733,9 @@ static int fermi_start_bulk_reads(struct usb_fermi* dev)
 			  usb_rcvbulkpipe(dev->udev, dev->bulk_in_endpointAddr),
 			  buf, BULK_TRANSFER_SIZE, fermi_bulk_read_complete, dev);
 	urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-	//usb_anchor_urb(urb, &dev->submitted);
 
-	/* send the data out the bulk port */
-	retval = usb_submit_urb(urb, GFP_KERNEL);
+	/* Submit through the anchor so disconnect can synchronously retire it. */
+	retval = fermi_submit_bulk_urb(dev, urb);
 
 error:
 	if (retval)
@@ -626,8 +772,9 @@ static int fermi_probe(struct usb_interface *interface, const struct usb_device_
 	mutex_init(&dev->io_mutex);
 	spin_lock_init(&dev->err_lock);
 	spin_lock_init(&dev->bulk_lock);
+	spin_lock_init(&dev->urb_lock);
 	init_usb_anchor(&dev->submitted);
-	init_completion(&dev->bulk_in_completion);
+	init_waitqueue_head(&dev->bulk_in_wait);
 
 	dev->udev = usb_get_dev(interface_to_usbdev(interface));
 	dev->interface = interface;
@@ -675,12 +822,15 @@ static int fermi_probe(struct usb_interface *interface, const struct usb_device_
 		goto error;
 	}
 	dev->input_dev->name = "Nextwindow Fermi Touchscreen";
-	dev->input_dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_ABS);
-	dev->input_dev->keybit[BIT_WORD(BTN_MOUSE)] = BIT_MASK(BTN_LEFT) | BIT_MASK(BTN_RIGHT) | BIT_MASK(BTN_TOOL_FINGER);
+	__set_bit(INPUT_PROP_DIRECT, dev->input_dev->propbit);
+	input_set_capability(dev->input_dev, EV_KEY, BTN_TOUCH);
 	input_set_abs_params(dev->input_dev, ABS_X, NW1950_MIN_X, NW1950_MAX_X, 0, 0);
 	input_set_abs_params(dev->input_dev, ABS_Y, NW1950_MIN_Y, NW1950_MAX_Y, 0, 0);
 #ifdef MULTITOUCH
-	input_set_abs_params(dev->input_dev, ABS_MT_TRACKING_ID, 0, 255, 0, 0);
+	retval = input_mt_init_slots(dev->input_dev, FERMI_MAX_TOUCHES,
+				     INPUT_MT_DIRECT | INPUT_MT_DROP_UNUSED);
+	if (retval)
+		goto error;
 	input_set_abs_params(dev->input_dev, ABS_MT_POSITION_X, NW1950_MIN_X, NW1950_MAX_X, 0, 0);
 	input_set_abs_params(dev->input_dev, ABS_MT_POSITION_Y, NW1950_MIN_Y, NW1950_MAX_Y, 0, 0);
 	input_set_abs_params(dev->input_dev, ABS_MT_TOUCH_MAJOR, NW1950_MIN_W, NW1950_MAX_W, 0, 0);
@@ -711,8 +861,13 @@ static int fermi_probe(struct usb_interface *interface, const struct usb_device_
 		 "NextWindow Fermi device now attached to nwfermi-%d\n",
 		 interface->minor);
 
-	/* start our bulk reader */
-	fermi_start_bulk_reads(dev);
+	/* Do not expose a live device when its mandatory bulk reader failed. */
+	retval = fermi_start_bulk_reads(dev);
+	if (retval) {
+		usb_deregister_dev(interface, &fermi_class);
+		usb_set_intfdata(interface, NULL);
+		goto error;
+	}
 
 	return 0;
 
@@ -736,19 +891,25 @@ static void fermi_disconnect(struct usb_interface *interface)
 
 	dev = usb_get_intfdata(interface);
 	usb_set_intfdata(interface, NULL);
+	if (!dev)
+		return;
 
-	/* prevent more I/O from starting */
+	/* Prevent a completion from resubmitting while teardown is in progress. */
+	spin_lock_irq(&dev->urb_lock);
+	WRITE_ONCE(dev->disconnected, true);
+	WRITE_ONCE(dev->bulk_stopping, true);
+	spin_unlock_irq(&dev->urb_lock);
+
+	/* prevent file operations from starting further device I/O */
 	mutex_lock(&dev->io_mutex);
 	dev->interface = NULL;
 	mutex_unlock(&dev->io_mutex);
 
+	/* Wait until every completion handler has returned before dropping kref. */
+	fermi_stop_bulk_reads(dev, -ENODEV);
+
 	/* give back our minor */
 	usb_deregister_dev(interface, &fermi_class);
-
-	usb_kill_anchored_urbs(&dev->submitted);
-
-	/* kill any current waiting IO */
-	complete(&dev->bulk_in_completion);
 
 	/* decrement our usage count */
 	kref_put(&dev->kref, fermi_delete);
@@ -758,11 +919,7 @@ static void fermi_disconnect(struct usb_interface *interface)
 
 static void fermi_draw_down(struct usb_fermi *dev)
 {
-	int time;
-
-	time = usb_wait_anchor_empty_timeout(&dev->submitted, 1000);
-	if (!time)
-		usb_kill_anchored_urbs(&dev->submitted);
+	fermi_stop_bulk_reads(dev, -EIO);
 }
 
 static int fermi_suspend(struct usb_interface *intf, pm_message_t message)
@@ -777,13 +934,31 @@ static int fermi_suspend(struct usb_interface *intf, pm_message_t message)
 
 static int fermi_resume (struct usb_interface *intf)
 {
-	return 0;
+	struct usb_fermi *dev = usb_get_intfdata(intf);
+	int retval;
+
+	if (!dev)
+		return 0;
+
+	mutex_lock(&dev->io_mutex);
+	if (!dev->interface)
+		retval = -ENODEV;
+	else
+		retval = fermi_start_bulk_reads(dev);
+	mutex_unlock(&dev->io_mutex);
+	if (retval) {
+		fermi_set_error(dev, retval);
+		wake_up_interruptible_all(&dev->bulk_in_wait);
+	}
+	return retval;
 }
 
 static int fermi_pre_reset(struct usb_interface *intf)
 {
 	struct usb_fermi *dev = usb_get_intfdata(intf);
 
+	if (!dev)
+		return 0;
 	mutex_lock(&dev->io_mutex);
 	fermi_draw_down(dev);
 
@@ -793,12 +968,18 @@ static int fermi_pre_reset(struct usb_interface *intf)
 static int fermi_post_reset(struct usb_interface *intf)
 {
 	struct usb_fermi *dev = usb_get_intfdata(intf);
+	int retval;
+
+	if (!dev)
+		return 0;
 
 	/* we are sure no URBs are active - no locking needed */
-	dev->errors = -EPIPE;
+	fermi_set_error(dev, -EPIPE);
+	retval = fermi_start_bulk_reads(dev);
 	mutex_unlock(&dev->io_mutex);
+	wake_up_interruptible_all(&dev->bulk_in_wait);
 
-	return 0;
+	return retval;
 }
 
 static struct usb_driver fermi_driver = {
@@ -835,3 +1016,4 @@ module_init(usb_fermi_init);
 module_exit(usb_fermi_exit);
 
 MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("NextWindow Fermi USB touchscreen driver");

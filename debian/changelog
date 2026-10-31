@@ -1,0 +1,22 @@
+nw-fermi-sb480 (0.6.5.1-1) unstable; urgency=medium
+
+  * Anchor every bulk-in URB submission and synchronously retire callbacks.
+  * Wake blocked readers on USB errors and disconnect, using a persistent
+    wait-queue condition instead of a reinitialized completion.
+  * Fail probe when the initial bulk reader cannot start.
+
+ -- SMART Board Linux Recovery Project <smartboard-linux@example.org>  Sat, 31 Oct 2026 13:20:00 +0200
+
+nw-fermi-sb480 (0.6.5.0-2) unstable; urgency=medium
+
+  * Register the DKMS source before autoinstalling it.
+  * Match the nwfermi character device in usbmisc udev events.
+  * Use the documented local daemon path and improve runtime diagnostics.
+
+ -- SMART Board Linux Recovery Project <smartboard-linux@example.org>  Sat, 31 Oct 2026 12:30:00 +0200
+
+nw-fermi-sb480 (0.6.5.0-1) unstable; urgency=medium
+
+  * Initial portable packaging for the SMART Board SB480 / NextWindow Fermi.
+
+ -- SMART Board Linux Recovery Project <smartboard-linux@example.org>  Thu, 29 Oct 2026 16:00:00 +0200

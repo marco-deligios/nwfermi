@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+  remove|purge)
+    # The source package owns this exact DKMS registration.  Do not unload a
+    # running module: DKMS only removes its registered build/install records.
+    dkms remove -m nw-fermi -v 0.6.5.1 --all || true
+    ;;
+esac
