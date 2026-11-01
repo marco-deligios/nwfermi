@@ -62,10 +62,17 @@ Evdev consegna un pacchetto tra due `SYN_REPORT`: un asse `ABS_*` non emesso
 in un pacchetto conserva il valore assoluto già confermato, non è un valore
 indeterminato. Lo strumento aggiorna la coppia soltanto al `SYN_REPORT` e
 richiede almeno un aggiornamento ABS dopo la pressione; può quindi usare
-l'altro asse confermato se non è cambiato. Dopo `SYN_DROPPED` invalida entrambe
-le coordinate e attende nuovi valori, evitando di combinare un asse nuovo con
-uno potenzialmente perso. Senza hardware non è possibile distinguere un driver
-che violi questa semantica da una coordinata realmente invariata.
+l'altro asse confermato se non è cambiato. Dopo `SYN_DROPPED` il protocollo
+evdev richiede di scartare tutti gli eventi fino al `SYN_REPORT` seguente: lo
+strumento entra quindi nello stato `DESYNCHRONIZED`, invalida la generazione e
+non produce campioni. Al `SYN_REPORT` di risincronizzazione consulta nel thread
+evdev `EVIOCGABS` tramite `absinfo()` e `EVIOCGKEY` tramite `active_keys()` per
+recuperare `ABS_X`, `ABS_Y` e `BTN_TOUCH`. Quel report non può acquisire un
+punto: l'utente deve premere `R` per autorizzare una nuova acquisizione. Se gli
+ioctl falliscono, lo stato del contatto resta sconosciuto e il successivo arm
+attende un rilascio reale, senza assumere che il dito sia stato sollevato.
+Senza hardware non è possibile distinguere un driver che violi questa semantica
+da una coordinata realmente invariata.
 
 La matrice affine di libinput è stimata sui quattro punti normalizzati. Se
 `(x, y)` sono le coordinate raw normalizzate da `ABS_X/ABS_Y` e `(u, v)` sono

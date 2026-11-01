@@ -325,10 +325,12 @@ class EvdevCapture:
     ARMED = "armed"
     PRESS_PENDING = "press-pending"
     CAPTURED = "captured"
+    DESYNCHRONIZED = "desynchronized"
     CLOSED = "closed"
 
     def __init__(self, device, on_sample: Callable[[int, int, int], None], on_error: Callable[[str], None],
-                 ecodes_module=None, on_release_ready: Callable[[int], None] | None = None):
+                 ecodes_module=None, on_release_ready: Callable[[int], None] | None = None,
+                 on_desynchronized: Callable[[str], None] | None = None):
         if ecodes_module is None:
             from evdev import ecodes as ecodes_module
         self.device = device
@@ -336,6 +338,7 @@ class EvdevCapture:
         self.on_sample = on_sample
         self.on_error = on_error
         self.on_release_ready = on_release_ready or (lambda _generation: None)
+        self.on_desynchronized = on_desynchronized or (lambda _message: None)
         # Values become usable only after the SYN_REPORT that confirms their
         # frame.  A missing ABS axis then means "unchanged", as specified by
         # evdev, not an opportunity to combine two unconfirmed updates.
@@ -346,8 +349,10 @@ class EvdevCapture:
         self.frame_has_x = False
         self.frame_has_y = False
         self.touch_down = False
+        self.touch_state_known = True
         self.state = self.IDLE
         self.generation = 0
+        self.desynchronized = False
         self.closed = threading.Event()
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self._run, name="nwfermi-evdev-capture", daemon=True)
@@ -360,13 +365,47 @@ class EvdevCapture:
         with self.lock:
             if self.closed.is_set():
                 raise CalibrationError("acquisizione evdev già chiusa")
+            if self.desynchronized:
+                raise CalibrationError("flusso evdev in risincronizzazione; attendere SYN_REPORT")
             self.generation += 1
-            self.state = self.WAIT_RELEASE if self.touch_down else self.ARMED
+            self.state = self.WAIT_RELEASE if not self.touch_state_known or self.touch_down else self.ARMED
             return self.generation
 
     def snapshot(self) -> tuple[str, int]:
         with self.lock:
             return self.state, self.generation
+
+    def generation_is_current(self, generation: int) -> bool:
+        """Prevent a queued pre-SYN_DROPPED callback reaching the GTK loop."""
+        with self.lock:
+            return not self.desynchronized and self.state != self.CLOSED and generation == self.generation
+
+    def _invalidate_coordinates(self) -> None:
+        self.confirmed_x = None
+        self.confirmed_y = None
+        self.frame_x = None
+        self.frame_y = None
+        self.frame_has_x = False
+        self.frame_has_y = False
+
+    def _recover_after_drop(self) -> str | None:
+        """Query EVIOCGABS/EVIOCGKEY through python-evdev, in the evdev thread."""
+        try:
+            x_info = self.device.absinfo(self.ecodes.ABS_X)
+            y_info = self.device.absinfo(self.ecodes.ABS_Y)
+            active_keys = self.device.active_keys()
+            self.confirmed_x = x_info.value
+            self.confirmed_y = y_info.value
+            self.touch_down = self.ecodes.BTN_TOUCH in active_keys
+            self.touch_state_known = True
+            return None
+        except (AttributeError, OSError) as error:
+            # Never infer a release after a queue overflow.  A later explicit
+            # arm waits for a real BTN_TOUCH release if the state is unknown.
+            self._invalidate_coordinates()
+            self.touch_down = True
+            self.touch_state_known = False
+            return f"impossibile recuperare lo stato evdev dopo SYN_DROPPED: {error}"
 
     def close(self) -> None:
         self.closed.set()
@@ -381,10 +420,26 @@ class EvdevCapture:
         """Process one event; public to permit deterministic fake-device tests."""
         sample = None
         release_ready = None
+        desync_message = None
         with self.lock:
             if self.state == self.CLOSED:
                 return
-            if event.type == self.ecodes.EV_ABS:
+            if self.desynchronized:
+                # Kernel evdev requires discarding every event up to and
+                # including the next SYN_REPORT.  That report only ends the
+                # discard interval; it never yields a calibration sample.
+                if event.type == self.ecodes.EV_SYN and event.code == self.ecodes.SYN_REPORT:
+                    desync_message = self._recover_after_drop()
+                    self.desynchronized = False
+                    self.state = self.IDLE
+                    if desync_message is None:
+                        desync_message = "flusso evdev risincronizzato; ripetere esplicitamente il punto corrente"
+                return_after_unlock = True
+            else:
+                return_after_unlock = False
+            if return_after_unlock:
+                pass
+            elif event.type == self.ecodes.EV_ABS:
                 if event.code == self.ecodes.ABS_X:
                     self.frame_x = event.value
                     self.frame_has_x = True
@@ -420,18 +475,20 @@ class EvdevCapture:
                 self.frame_y = None
             elif (event.type == self.ecodes.EV_SYN
                   and event.code == getattr(self.ecodes, "SYN_DROPPED", -1)):
-                # We cannot know which ABS events were lost.  Do not combine
-                # a later one-axis update with an old coordinate.
-                self.confirmed_x = None
-                self.confirmed_y = None
-                self.frame_x = None
-                self.frame_y = None
-                self.frame_has_x = False
-                self.frame_has_y = False
+                # Invalidate the active token before GTK handles any queued
+                # sample from the lost sequence.
+                self.generation += 1
+                self.desynchronized = True
+                self.state = self.DESYNCHRONIZED
+                self.touch_state_known = False
+                self._invalidate_coordinates()
+                desync_message = "SYN_DROPPED: eventi scartati fino alla risincronizzazione"
         if sample is not None:
             self.on_sample(*sample)
         if release_ready is not None:
             self.on_release_ready(release_ready)
+        if desync_message is not None:
+            self.on_desynchronized(desync_message)
 
     def _run(self) -> None:
         try:
@@ -505,7 +562,9 @@ def run_gtk_calibration(args: argparse.Namespace) -> int:
                 self.got_sample, x, y, generation),
                                         lambda message: GLib.idle_add(self.capture_failed, message),
                                         on_release_ready=lambda generation: GLib.idle_add(
-                                            self.release_ready, generation))
+                                            self.release_ready, generation),
+                                        on_desynchronized=lambda message: GLib.idle_add(
+                                            self.capture_desynchronized, message))
             self.capture.start()
             GLib.idle_add(self.next_point)
 
@@ -569,7 +628,8 @@ def run_gtk_calibration(args: argparse.Namespace) -> int:
             self.expected_generation = self.capture.arm_point()
 
         def got_sample(self, x, y, generation):
-            if self.point_index >= 4 or generation != self.expected_generation:
+            if (self.point_index >= 4 or generation != self.expected_generation
+                    or not self.capture.generation_is_current(generation)):
                 return False
             self.expected_generation = None
             self.samples.append((x, y))
@@ -588,6 +648,14 @@ def run_gtk_calibration(args: argparse.Namespace) -> int:
             self.expected_generation = None
             self.pending_matrix = None
             self.status.set_label(message)
+            return False
+
+        def capture_desynchronized(self, message):
+            # Do not arm here: after queue loss the user must explicitly
+            # choose R once the evdev thread has completed recovery.
+            self.expected_generation = None
+            self.pending_matrix = None
+            self.status.set_label(message + ". Premere R per ripetere il punto corrente.")
             return False
 
         def finish(self):

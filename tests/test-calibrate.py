@@ -103,11 +103,27 @@ class FakeEcodes:
 
 
 class FakeDevice:
+    def __init__(self):
+        self.x = 100
+        self.y = 200
+        self.touch = False
+        self.recovery_error = None
+
     def close(self):
         pass
 
     def read_loop(self):
         return iter(())
+
+    def absinfo(self, code):
+        if self.recovery_error:
+            raise self.recovery_error
+        return SimpleNamespace(value=self.x if code == FakeEcodes.ABS_X else self.y)
+
+    def active_keys(self):
+        if self.recovery_error:
+            raise self.recovery_error
+        return [FakeEcodes.BTN_TOUCH] if self.touch else []
 
 
 def event(kind, code, value=0):
@@ -119,9 +135,11 @@ class EvdevCaptureTests(unittest.TestCase):
         self.samples = []
         self.errors = []
         self.release_ready = []
+        self.desync_messages = []
+        self.device = FakeDevice()
         self.capture = cal.EvdevCapture(
-            FakeDevice(), lambda x, y, generation: self.samples.append((x, y, generation)),
-            self.errors.append, FakeEcodes, self.release_ready.append
+            self.device, lambda x, y, generation: self.samples.append((x, y, generation)),
+            self.errors.append, FakeEcodes, self.release_ready.append, self.desync_messages.append
         )
 
     def feed(self, *events):
@@ -195,15 +213,57 @@ class EvdevCaptureTests(unittest.TestCase):
 
     def test_dropped_frame_invalidates_residual_axes(self):
         self.prime_axes(100, 200)
-        token = self.capture.arm_point()
+        self.capture.arm_point()
+        self.device.x = 300
+        self.device.y = 400
+        self.device.touch = True
         self.feed(event(FakeEcodes.EV_SYN, FakeEcodes.SYN_DROPPED),
                   event(FakeEcodes.EV_KEY, FakeEcodes.BTN_TOUCH, 1),
                   event(FakeEcodes.EV_ABS, FakeEcodes.ABS_X, 300),
                   event(FakeEcodes.EV_SYN, FakeEcodes.SYN_REPORT))
         self.assertEqual(self.samples, [])
-        self.feed(event(FakeEcodes.EV_ABS, FakeEcodes.ABS_Y, 400),
+        self.assertEqual(self.capture.snapshot()[0], cal.EvdevCapture.IDLE)
+        self.assertTrue(self.desync_messages)
+        # Recovery knows the finger is still down; a new explicit arm waits
+        # for release and cannot manufacture a sample from lost events.
+        self.assertEqual(self.capture.arm_point() > 0, True)
+        self.assertEqual(self.capture.snapshot()[0], cal.EvdevCapture.WAIT_RELEASE)
+
+    def test_drop_discards_events_and_recovery_with_released_touch_needs_explicit_arm(self):
+        self.capture.arm_point()
+        self.device.x = 500
+        self.device.y = 600
+        self.device.touch = False
+        self.feed(event(FakeEcodes.EV_SYN, FakeEcodes.SYN_DROPPED),
+                  event(FakeEcodes.EV_ABS, FakeEcodes.ABS_X, 900),
+                  event(FakeEcodes.EV_ABS, FakeEcodes.ABS_Y, 901),
+                  event(FakeEcodes.EV_KEY, FakeEcodes.BTN_TOUCH, 1),
                   event(FakeEcodes.EV_SYN, FakeEcodes.SYN_REPORT))
-        self.assertEqual(self.samples, [(300, 400, token)])
+        self.assertEqual(self.samples, [])
+        self.assertEqual(self.capture.snapshot()[0], cal.EvdevCapture.IDLE)
+        token = self.capture.arm_point()
+        self.complete_press(500, 600)
+        self.assertEqual(self.samples, [(500, 600, token)])
+
+    def test_failed_recovery_keeps_touch_state_unknown_and_does_not_rearm(self):
+        self.capture.arm_point()
+        self.device.recovery_error = OSError("ioctl failed")
+        self.feed(event(FakeEcodes.EV_SYN, FakeEcodes.SYN_DROPPED),
+                  event(FakeEcodes.EV_SYN, FakeEcodes.SYN_REPORT))
+        self.assertEqual(self.capture.snapshot()[0], cal.EvdevCapture.IDLE)
+        self.assertIn("impossibile recuperare", self.desync_messages[-1])
+        self.capture.arm_point()
+        self.assertEqual(self.capture.snapshot()[0], cal.EvdevCapture.WAIT_RELEASE)
+
+    def test_drop_invalidates_a_queued_generation(self):
+        token = self.capture.arm_point()
+        self.feed(event(FakeEcodes.EV_KEY, FakeEcodes.BTN_TOUCH, 1),
+                  event(FakeEcodes.EV_ABS, FakeEcodes.ABS_X, 10),
+                  event(FakeEcodes.EV_ABS, FakeEcodes.ABS_Y, 20),
+                  event(FakeEcodes.EV_SYN, FakeEcodes.SYN_REPORT))
+        self.assertEqual(self.samples, [(10, 20, token)])
+        self.feed(event(FakeEcodes.EV_SYN, FakeEcodes.SYN_DROPPED))
+        self.assertFalse(self.capture.generation_is_current(token))
 
     def test_retry_discards_old_generation(self):
         self.capture.arm_point()
