@@ -97,6 +97,7 @@ class FakeEcodes:
     ABS_Y = 11
     BTN_TOUCH = 12
     SYN_REPORT = 13
+    SYN_DROPPED = 16
     EV_PROP = 14
     INPUT_PROP_DIRECT = 15
 
@@ -133,6 +134,11 @@ class EvdevCaptureTests(unittest.TestCase):
                   event(FakeEcodes.EV_ABS, FakeEcodes.ABS_Y, y),
                   event(FakeEcodes.EV_SYN, FakeEcodes.SYN_REPORT))
 
+    def prime_axes(self, x=100, y=200):
+        self.feed(event(FakeEcodes.EV_ABS, FakeEcodes.ABS_X, x),
+                  event(FakeEcodes.EV_ABS, FakeEcodes.ABS_Y, y),
+                  event(FakeEcodes.EV_SYN, FakeEcodes.SYN_REPORT))
+
     def test_one_sample_requires_explicit_arm_and_coordinates_after_press(self):
         token = self.capture.arm_point()
         self.complete_press()
@@ -160,6 +166,50 @@ class EvdevCaptureTests(unittest.TestCase):
         self.assertEqual(self.samples, [])
         self.assertEqual(self.capture.snapshot()[0], cal.EvdevCapture.IDLE)
         self.assertGreater(token, 0)
+
+    def test_single_axis_update_uses_only_a_syn_confirmed_other_axis(self):
+        self.prime_axes(100, 200)
+        token = self.capture.arm_point()
+        self.feed(event(FakeEcodes.EV_KEY, FakeEcodes.BTN_TOUCH, 1),
+                  event(FakeEcodes.EV_ABS, FakeEcodes.ABS_X, 300),
+                  event(FakeEcodes.EV_SYN, FakeEcodes.SYN_REPORT))
+        self.assertEqual(self.samples, [(300, 200, token)])
+
+    def test_y_only_update_and_abs_before_press_are_coherent(self):
+        self.prime_axes(100, 200)
+        token = self.capture.arm_point()
+        self.feed(event(FakeEcodes.EV_ABS, FakeEcodes.ABS_Y, 400),
+                  event(FakeEcodes.EV_KEY, FakeEcodes.BTN_TOUCH, 1),
+                  event(FakeEcodes.EV_SYN, FakeEcodes.SYN_REPORT))
+        self.assertEqual(self.samples, [(100, 400, token)])
+
+    def test_press_without_abs_and_split_frames_do_not_mix_coordinates(self):
+        self.prime_axes(100, 200)
+        token = self.capture.arm_point()
+        self.feed(event(FakeEcodes.EV_KEY, FakeEcodes.BTN_TOUCH, 1),
+                  event(FakeEcodes.EV_SYN, FakeEcodes.SYN_REPORT))
+        self.assertEqual(self.samples, [])
+        self.feed(event(FakeEcodes.EV_ABS, FakeEcodes.ABS_X, 300),
+                  event(FakeEcodes.EV_SYN, FakeEcodes.SYN_REPORT))
+        self.assertEqual(self.samples, [(300, 200, token)])
+
+    def test_dropped_frame_invalidates_residual_axes(self):
+        self.prime_axes(100, 200)
+        token = self.capture.arm_point()
+        self.feed(event(FakeEcodes.EV_SYN, FakeEcodes.SYN_DROPPED),
+                  event(FakeEcodes.EV_KEY, FakeEcodes.BTN_TOUCH, 1),
+                  event(FakeEcodes.EV_ABS, FakeEcodes.ABS_X, 300),
+                  event(FakeEcodes.EV_SYN, FakeEcodes.SYN_REPORT))
+        self.assertEqual(self.samples, [])
+        self.feed(event(FakeEcodes.EV_ABS, FakeEcodes.ABS_Y, 400),
+                  event(FakeEcodes.EV_SYN, FakeEcodes.SYN_REPORT))
+        self.assertEqual(self.samples, [(300, 400, token)])
+
+    def test_retry_discards_old_generation(self):
+        self.capture.arm_point()
+        token = self.capture.arm_point()
+        self.complete_press(700, 800)
+        self.assertEqual(self.samples, [(700, 800, token)])
 
     def test_close_prevents_future_samples(self):
         self.capture.arm_point()

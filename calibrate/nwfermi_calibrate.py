@@ -336,12 +336,18 @@ class EvdevCapture:
         self.on_sample = on_sample
         self.on_error = on_error
         self.on_release_ready = on_release_ready or (lambda _generation: None)
-        self.current_x = None
-        self.current_y = None
+        # Values become usable only after the SYN_REPORT that confirms their
+        # frame.  A missing ABS axis then means "unchanged", as specified by
+        # evdev, not an opportunity to combine two unconfirmed updates.
+        self.confirmed_x = None
+        self.confirmed_y = None
+        self.frame_x = None
+        self.frame_y = None
+        self.frame_has_x = False
+        self.frame_has_y = False
         self.touch_down = False
         self.state = self.IDLE
         self.generation = 0
-        self.coordinates_after_press = False
         self.closed = threading.Event()
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self._run, name="nwfermi-evdev-capture", daemon=True)
@@ -355,7 +361,6 @@ class EvdevCapture:
             if self.closed.is_set():
                 raise CalibrationError("acquisizione evdev già chiusa")
             self.generation += 1
-            self.coordinates_after_press = False
             self.state = self.WAIT_RELEASE if self.touch_down else self.ARMED
             return self.generation
 
@@ -381,13 +386,11 @@ class EvdevCapture:
                 return
             if event.type == self.ecodes.EV_ABS:
                 if event.code == self.ecodes.ABS_X:
-                    self.current_x = event.value
-                    if self.state == self.PRESS_PENDING:
-                        self.coordinates_after_press = True
+                    self.frame_x = event.value
+                    self.frame_has_x = True
                 elif event.code == self.ecodes.ABS_Y:
-                    self.current_y = event.value
-                    if self.state == self.PRESS_PENDING:
-                        self.coordinates_after_press = True
+                    self.frame_y = event.value
+                    self.frame_has_y = True
             elif event.type == self.ecodes.EV_KEY and event.code == self.ecodes.BTN_TOUCH:
                 if event.value == 0:
                     self.touch_down = False
@@ -401,12 +404,30 @@ class EvdevCapture:
                     self.touch_down = True
                     if self.state == self.ARMED:
                         self.state = self.PRESS_PENDING
-                        self.coordinates_after_press = False
             elif event.type == self.ecodes.EV_SYN and event.code == self.ecodes.SYN_REPORT:
-                if (self.state == self.PRESS_PENDING and self.coordinates_after_press
-                        and self.current_x is not None and self.current_y is not None):
-                    sample = (self.current_x, self.current_y, self.generation)
+                frame_has_update = self.frame_has_x or self.frame_has_y
+                if self.frame_has_x:
+                    self.confirmed_x = self.frame_x
+                if self.frame_has_y:
+                    self.confirmed_y = self.frame_y
+                if (self.state == self.PRESS_PENDING and frame_has_update
+                        and self.confirmed_x is not None and self.confirmed_y is not None):
+                    sample = (self.confirmed_x, self.confirmed_y, self.generation)
                     self.state = self.CAPTURED
+                self.frame_has_x = False
+                self.frame_has_y = False
+                self.frame_x = None
+                self.frame_y = None
+            elif (event.type == self.ecodes.EV_SYN
+                  and event.code == getattr(self.ecodes, "SYN_DROPPED", -1)):
+                # We cannot know which ABS events were lost.  Do not combine
+                # a later one-axis update with an old coordinate.
+                self.confirmed_x = None
+                self.confirmed_y = None
+                self.frame_x = None
+                self.frame_y = None
+                self.frame_has_x = False
+                self.frame_has_y = False
         if sample is not None:
             self.on_sample(*sample)
         if release_ready is not None:

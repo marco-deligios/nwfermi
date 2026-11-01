@@ -58,6 +58,15 @@ GTK. Per ogni croce la cattura viene armata esplicitamente dall'interfaccia;
 un rilascio non arma il punto successivo e un dito già appoggiato viene
 ignorato. `R` ripete il punto corrente e `Esc` annulla in qualunque fase.
 
+Evdev consegna un pacchetto tra due `SYN_REPORT`: un asse `ABS_*` non emesso
+in un pacchetto conserva il valore assoluto già confermato, non è un valore
+indeterminato. Lo strumento aggiorna la coppia soltanto al `SYN_REPORT` e
+richiede almeno un aggiornamento ABS dopo la pressione; può quindi usare
+l'altro asse confermato se non è cambiato. Dopo `SYN_DROPPED` invalida entrambe
+le coordinate e attende nuovi valori, evitando di combinare un asse nuovo con
+uno potenzialmente perso. Senza hardware non è possibile distinguere un driver
+che violi questa semantica da una coordinata realmente invariata.
+
 La matrice affine di libinput è stimata sui quattro punti normalizzati. Se
 `(x, y)` sono le coordinate raw normalizzate da `ABS_X/ABS_Y` e `(u, v)` sono
 le coordinate normalizzate dello schermo, la matrice è nel verso libinput:
