@@ -40,6 +40,53 @@ fermare le unità template; il modulo non viene scaricato automaticamente.
 SMART Orient e SMARTBoardService non fanno parte del pacchetto e non sono
 supportati sotto Wayland senza collaudo Xorg isolato.
 
+## Calibrazione geometrica Wayland/libinput
+
+`nwfermi-calibrate` non avvia il daemon proprietario e non modifica il modulo
+kernel. Va eseguito dall'utente della sessione GNOME, dopo che il dispositivo
+input `Nextwindow Fermi Touchscreen` è stato creato:
+
+```bash
+nwfermi-calibrate
+```
+
+L'applicazione GTK4 a schermo intero richiede quattro tocchi nell'ordine
+alto-sinistra, alto-destra, basso-sinistra, basso-destra. Le croci hanno un
+margine di 80 pixel, modificabile con `--margin`. Le coordinate provengono
+direttamente da evdev (`ABS_X`, `ABS_Y`, `BTN_TOUCH`, `SYN_REPORT`), non da
+GTK. `R` ripete il punto corrente e `Esc` annulla.
+
+La matrice affine di libinput è stimata sui quattro punti normalizzati. Se
+`(x, y)` sono le coordinate raw normalizzate da `ABS_X/ABS_Y` e `(u, v)` sono
+le coordinate normalizzate dello schermo, la matrice è nel verso libinput:
+`u=a*x+b*y+c`, `v=d*x+e*y+f`. Punti incompleti, degeneri, invertiti o con
+residui incoerenti sono rifiutati.
+Prima della scrittura viene mostrata la matrice e l'utente deve premere Invio.
+Solo allora `pkexec` esegue l'helper ristretto che salva, con backup e
+sostituzione atomica, `/etc/udev/rules.d/99-nwfermi-calibration.rules`.
+La regola identifica `ATTRS{name}=="Nextwindow Fermi Touchscreen"`; non
+dipende da `eventN`, porta USB o identificatore USB.
+
+Comandi senza modifica della configurazione:
+
+```bash
+nwfermi-calibrate --dry-run
+nwfermi-calibrate --verify     # misura la matrice già installata
+nwfermi-calibrate --simulate tests/fixtures/calibration-regression.json
+```
+
+`--verify` confronta i quattro tocchi con la matrice già salvata nella regola
+(per test offline si può indicare `--rule FILE`). `--restore` richiede
+autorizzazione e ripristina il backup della regola.
+Dopo un'applicazione la regola viene ricaricata con `udevadm control
+--reload-rules`; chiudere e riaprire la sessione GNOME per garantire che
+libinput rilegga la proprietà. Lo strumento non forza logout, reboot,
+ricaricamento del driver o riavvio del daemon.
+
+La calibrazione reale, l'accesso evdev dell'utente e il momento effettivo in
+cui GNOME/libinput applica una nuova regola restano da verificare con la
+lavagna collegata.
+
 Il package verifica staticamente il daemon prima dell'avvio, ma non può provare
 senza hardware che il figlio creato dal double-fork resti nel cgroup systemd.
 Non dichiarare l'installazione pronta per distribuzione finché il collaudo di

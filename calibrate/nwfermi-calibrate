@@ -1,0 +1,8 @@
+#!/usr/bin/python3
+"""Installed command wrapper for nwfermi-calibrate."""
+import sys
+
+sys.path.insert(0, "/usr/lib/nwfermi")
+from nwfermi_calibrate import main
+
+raise SystemExit(main())

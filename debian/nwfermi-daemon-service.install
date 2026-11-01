@@ -3,4 +3,6 @@ packaging/lib/udev/rules.d/70-nwfermi-sb480.rules lib/udev/rules.d
 packaging/lib/systemd/system/nwfermi-daemon@.service lib/systemd/system
 packaging/usr/lib/tmpfiles.d/nwfermi.conf usr/lib/tmpfiles.d
 packaging/usr/lib/nwfermi/nwfermi-daemonctl usr/lib/nwfermi
+calibrate/nwfermi-calibrate usr/bin
+calibrate/nwfermi_calibrate.py usr/lib/nwfermi
 packaging/usr/share/doc/nwfermi-daemon-service/README.Debian usr/share/doc/nwfermi-daemon-service

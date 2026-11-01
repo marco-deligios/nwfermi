@@ -32,6 +32,12 @@ grep -Fq 'dkms add -m nw-fermi -v 0.6.5.1' debian/nw-fermi-dkms.postinst
 grep -Fq 'dkms autoinstall -m nw-fermi -v 0.6.5.1' debian/nw-fermi-dkms.postinst
 ! grep -R -F '/dev/nwfermi2' debian packaging
 ! grep -R -F 'nwfermi-daemon-0.6.5.0-1.fc16' debian packaging
+test -x calibrate/nwfermi-calibrate
+test -f calibrate/nwfermi_calibrate.py
+grep -Fq 'python3-evdev' debian/control
+grep -Fq 'gir1.2-gtk-4.0' debian/control
+grep -Fq 'calibrate/nwfermi-calibrate usr/bin' debian/nwfermi-daemon-service.install
+grep -Fq 'calibrate/nwfermi_calibrate.py usr/lib/nwfermi' debian/nwfermi-daemon-service.install
 
 tmp=$(mktemp -d /tmp/nwfermi-packaging-test.XXXXXX)
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM

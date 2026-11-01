@@ -15,7 +15,7 @@ Description: DKMS source for the NextWindow Fermi input module
 
 Package: nwfermi-daemon-service
 Architecture: all
-Depends: ${misc:Depends}, binutils, kmod, udev
+Depends: ${misc:Depends}, binutils, gir1.2-gtk-4.0, kmod, pkexec, python3, python3-evdev, python3-gi, udev
 Recommends: nw-fermi-dkms
 Description: udev and systemd integration for a user-supplied NextWindow daemon
  Starts one NextWindow daemon for the single supported SMART Board SB480.
@@ -23,3 +23,5 @@ Description: udev and systemd integration for a user-supplied NextWindow daemon
  another daemon.
  The proprietary daemon is deliberately not shipped: the administrator must
  install an original copy at the configured path.
+ This package also provides nwfermi-calibrate, a GTK4 four-point calibration
+ utility which writes a libinput udev calibration rule only after confirmation.
