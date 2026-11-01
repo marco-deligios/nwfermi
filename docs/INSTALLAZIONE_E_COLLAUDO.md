@@ -54,7 +54,9 @@ L'applicazione GTK4 a schermo intero richiede quattro tocchi nell'ordine
 alto-sinistra, alto-destra, basso-sinistra, basso-destra. Le croci hanno un
 margine di 80 pixel, modificabile con `--margin`. Le coordinate provengono
 direttamente da evdev (`ABS_X`, `ABS_Y`, `BTN_TOUCH`, `SYN_REPORT`), non da
-GTK. `R` ripete il punto corrente e `Esc` annulla.
+GTK. Per ogni croce la cattura viene armata esplicitamente dall'interfaccia;
+un rilascio non arma il punto successivo e un dito già appoggiato viene
+ignorato. `R` ripete il punto corrente e `Esc` annulla in qualunque fase.
 
 La matrice affine di libinput è stimata sui quattro punti normalizzati. Se
 `(x, y)` sono le coordinate raw normalizzate da `ABS_X/ABS_Y` e `(u, v)` sono
@@ -86,6 +88,14 @@ ricaricamento del driver o riavvio del daemon.
 La calibrazione reale, l'accesso evdev dell'utente e il momento effettivo in
 cui GNOME/libinput applica una nuova regola restano da verificare con la
 lavagna collegata.
+
+L'accesso diretto a `/dev/input/event*` richiede normalmente l'ACL assegnata
+da `systemd-logind` alla sessione grafica locale. Avviare quindi lo strumento
+dall'utente che ha effettuato l'accesso GNOME; in caso di `permesso negato`,
+verificare la sessione locale e il suo seat con `loginctl`/l'amministratore.
+Non usare `chmod 666`, non aggiungere permessi permanenti e non avviare la GUI
+come root. Il funzionamento dell'ACL con la lavagna e la configurazione GNOME
+reale resta un punto di collaudo hardware.
 
 Il package verifica staticamente il daemon prima dell'avvio, ma non può provare
 senza hardware che il figlio creato dal double-fork resti nel cgroup systemd.

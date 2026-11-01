@@ -4,6 +4,7 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 
 
@@ -70,17 +71,129 @@ class UdevRuleTests(unittest.TestCase):
             self.assertNotIn("0b8c", content)
             self.assertEqual((directory / (cal.RULE_NAME + ".bak")).read_text(encoding="utf-8"), original)
             self.assertEqual(cal.load_rule_matrix(target), (1.0, 0.0, 0.0, 0.0, 1.0, 0.0))
+            cal.install_rule((1, 0, 0, 0, 1, 0), directory, reload_rules=False)
+            self.assertEqual((directory / (cal.RULE_NAME + ".bak")).read_text(encoding="utf-8"), original)
             cal.restore_rule(directory, reload_rules=False)
             self.assertEqual(target.read_text(encoding="utf-8"), original)
 
     def test_rule_rejects_invalid_matrix(self):
         with self.assertRaises(cal.CalibrationError):
             cal.build_rule((1, 0, 0))
+        with self.assertRaises(cal.CalibrationError):
+            cal.build_rule((-1, 0, 0, 0, 1, 0))
+        self.assertEqual(cal.INSTALLED_COMMAND, Path("/usr/bin/nwfermi-calibrate"))
 
     def test_verify_measures_installed_matrix_without_fitting(self):
         targets = cal.normalized_targets(1920, 1080, 80)
         result = cal.evaluate_matrix((1, 0, 0, 0, 1, 0), targets, targets)
         self.assertEqual(result.rms_residual, 0.0)
+
+
+class FakeEcodes:
+    EV_ABS = 1
+    EV_KEY = 2
+    EV_SYN = 3
+    ABS_X = 10
+    ABS_Y = 11
+    BTN_TOUCH = 12
+    SYN_REPORT = 13
+    EV_PROP = 14
+    INPUT_PROP_DIRECT = 15
+
+
+class FakeDevice:
+    def close(self):
+        pass
+
+    def read_loop(self):
+        return iter(())
+
+
+def event(kind, code, value=0):
+    return SimpleNamespace(type=kind, code=code, value=value)
+
+
+class EvdevCaptureTests(unittest.TestCase):
+    def setUp(self):
+        self.samples = []
+        self.errors = []
+        self.release_ready = []
+        self.capture = cal.EvdevCapture(
+            FakeDevice(), lambda x, y, generation: self.samples.append((x, y, generation)),
+            self.errors.append, FakeEcodes, self.release_ready.append
+        )
+
+    def feed(self, *events):
+        for item in events:
+            self.capture.process_event(item)
+
+    def complete_press(self, x=100, y=200):
+        self.feed(event(FakeEcodes.EV_KEY, FakeEcodes.BTN_TOUCH, 1),
+                  event(FakeEcodes.EV_ABS, FakeEcodes.ABS_X, x),
+                  event(FakeEcodes.EV_ABS, FakeEcodes.ABS_Y, y),
+                  event(FakeEcodes.EV_SYN, FakeEcodes.SYN_REPORT))
+
+    def test_one_sample_requires_explicit_arm_and_coordinates_after_press(self):
+        token = self.capture.arm_point()
+        self.complete_press()
+        self.assertEqual(self.samples, [(100, 200, token)])
+        self.feed(event(FakeEcodes.EV_KEY, FakeEcodes.BTN_TOUCH, 0))
+        self.assertEqual(self.capture.snapshot()[0], cal.EvdevCapture.CAPTURED)
+        self.complete_press(300, 400)
+        self.assertEqual(len(self.samples), 1)
+        self.feed(event(FakeEcodes.EV_KEY, FakeEcodes.BTN_TOUCH, 0))
+        next_token = self.capture.arm_point()
+        self.complete_press(300, 400)
+        self.assertEqual(self.samples[-1], (300, 400, next_token))
+
+    def test_held_touch_and_incomplete_frame_are_not_captured(self):
+        self.feed(event(FakeEcodes.EV_KEY, FakeEcodes.BTN_TOUCH, 1))
+        self.capture.arm_point()
+        self.assertEqual(self.capture.snapshot()[0], cal.EvdevCapture.WAIT_RELEASE)
+        self.feed(event(FakeEcodes.EV_KEY, FakeEcodes.BTN_TOUCH, 0))
+        self.assertEqual(self.capture.snapshot()[0], cal.EvdevCapture.IDLE)
+        self.assertEqual(len(self.release_ready), 1)
+        token = self.capture.arm_point()
+        self.feed(event(FakeEcodes.EV_KEY, FakeEcodes.BTN_TOUCH, 1),
+                  event(FakeEcodes.EV_SYN, FakeEcodes.SYN_REPORT),
+                  event(FakeEcodes.EV_KEY, FakeEcodes.BTN_TOUCH, 0))
+        self.assertEqual(self.samples, [])
+        self.assertEqual(self.capture.snapshot()[0], cal.EvdevCapture.IDLE)
+        self.assertGreater(token, 0)
+
+    def test_close_prevents_future_samples(self):
+        self.capture.arm_point()
+        self.capture.close()
+        self.complete_press()
+        self.assertEqual(self.samples, [])
+        self.assertEqual(self.capture.snapshot()[0], cal.EvdevCapture.CLOSED)
+
+
+class DiscoveryTests(unittest.TestCase):
+    def test_permission_denied_is_distinct_from_absent_device(self):
+        def denied(_path):
+            raise PermissionError("denied")
+
+        with self.assertRaisesRegex(cal.CalibrationError, "permesso negato.*logind"):
+            cal.discover_device(denied, lambda: ["/dev/input/event99"], FakeEcodes)
+
+    def test_matching_virtual_device_uses_name_and_capabilities(self):
+        class MatchingDevice:
+            name = cal.DEVICE_NAME
+            path = "/dev/input/event55"
+
+            def capabilities(self, absinfo=False):
+                return {
+                    FakeEcodes.EV_ABS: [(FakeEcodes.ABS_X, object()), (FakeEcodes.ABS_Y, object())],
+                    FakeEcodes.EV_KEY: [FakeEcodes.BTN_TOUCH],
+                    FakeEcodes.EV_PROP: [FakeEcodes.INPUT_PROP_DIRECT],
+                }
+
+            def close(self):
+                pass
+
+        device = cal.discover_device(lambda _path: MatchingDevice(), lambda: ["/dev/input/event55"], FakeEcodes)
+        self.assertEqual(device.name, cal.DEVICE_NAME)
 
 
 if __name__ == "__main__":

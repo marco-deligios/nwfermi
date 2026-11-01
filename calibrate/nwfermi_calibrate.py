@@ -26,6 +26,7 @@ from typing import Callable, Sequence
 DEVICE_NAME = "Nextwindow Fermi Touchscreen"
 RULE_NAME = "99-nwfermi-calibration.rules"
 RULE_DIRECTORY = Path("/etc/udev/rules.d")
+INSTALLED_COMMAND = Path("/usr/bin/nwfermi-calibrate")
 DEFAULT_MARGIN = 80
 MAX_RMS_RESIDUAL = 0.025
 MAX_POINT_RESIDUAL = 0.050
@@ -140,7 +141,12 @@ def fit_raw_samples(
 def format_matrix(matrix: Sequence[float]) -> str:
     if len(matrix) != 6 or not all(math.isfinite(value) for value in matrix):
         raise CalibrationError("matrice di calibrazione non valida")
-    return " ".join(f"{value:.9g}" for value in matrix)
+    values = tuple(float(value) for value in matrix)
+    if values[0] * values[4] - values[1] * values[3] <= MIN_DETERMINANT:
+        raise CalibrationError("matrice di calibrazione invertita o degenere")
+    if any(abs(value) > 10 for value in values):
+        raise CalibrationError("matrice di calibrazione fuori intervallo")
+    return " ".join(f"{value:.9g}" for value in values)
 
 
 def build_rule(matrix: Sequence[float]) -> str:
@@ -166,8 +172,10 @@ def load_rule_matrix(rule_path: Path) -> tuple[float, float, float, float, float
         values = tuple(float(value) for value in match.group(1).split())
     except ValueError as error:
         raise CalibrationError("matrice nella regola non valida") from error
-    if len(values) != 6 or not all(math.isfinite(value) for value in values):
-        raise CalibrationError("matrice nella regola non valida")
+    try:
+        format_matrix(values)
+    except CalibrationError as error:
+        raise CalibrationError("matrice nella regola non valida") from error
     return values  # type: ignore[return-value]
 
 
@@ -219,7 +227,7 @@ def install_rule(matrix: Sequence[float], rule_dir: Path = RULE_DIRECTORY, reloa
         raise CalibrationError(f"directory regole udev assente: {rule_dir}")
     target = rule_dir / RULE_NAME
     backup = rule_dir / f"{RULE_NAME}.bak"
-    if target.exists():
+    if target.exists() and target.read_text(encoding="utf-8") != content:
         shutil.copy2(target, backup)
     _atomic_write(target, content)
     if target.read_text(encoding="utf-8") != content:
@@ -253,30 +261,46 @@ def load_simulation(path: Path) -> tuple[list[tuple[int, int]], AxisRange, AxisR
         raise CalibrationError(f"file di simulazione non valido: {error}") from error
 
 
-def discover_device():
+def discover_device(input_device_class=None, list_devices_fn=None, ecodes_module=None):
     """Find exactly one evdev device by virtual input identity and capabilities."""
-    try:
-        from evdev import InputDevice, ecodes, list_devices
-    except ImportError as error:
-        raise CalibrationError("python3-evdev non disponibile") from error
-    matches = []
-    for path in list_devices():
+    if input_device_class is None or list_devices_fn is None or ecodes_module is None:
         try:
-            device = InputDevice(path)
+            from evdev import InputDevice, ecodes, list_devices
+        except ImportError as error:
+            raise CalibrationError("python3-evdev non disponibile") from error
+        input_device_class = InputDevice
+        list_devices_fn = list_devices
+        ecodes_module = ecodes
+    matches = []
+    denied_paths = []
+    for path in list_devices_fn():
+        try:
+            device = input_device_class(path)
             capabilities = device.capabilities(absinfo=True)
-            abs_codes = {entry[0] if isinstance(entry, tuple) else entry for entry in capabilities.get(ecodes.EV_ABS, [])}
-            key_codes = set(capabilities.get(ecodes.EV_KEY, []))
+            abs_codes = {entry[0] if isinstance(entry, tuple) else entry
+                         for entry in capabilities.get(ecodes_module.EV_ABS, [])}
+            key_codes = set(capabilities.get(ecodes_module.EV_KEY, []))
             # The driver gives this virtual device INPUT_PROP_DIRECT plus the
             # two legacy axes and BTN_TOUCH.  Do not use its transient eventN
             # node or the physical USB parent as identity.
-            direct = ecodes.INPUT_PROP_DIRECT in device.capabilities().get(ecodes.EV_PROP, [])
-            if (device.name == DEVICE_NAME and direct and ecodes.ABS_X in abs_codes
-                    and ecodes.ABS_Y in abs_codes and ecodes.BTN_TOUCH in key_codes):
+            direct = ecodes_module.INPUT_PROP_DIRECT in device.capabilities().get(ecodes_module.EV_PROP, [])
+            if (device.name == DEVICE_NAME and direct and ecodes_module.ABS_X in abs_codes
+                    and ecodes_module.ABS_Y in abs_codes and ecodes_module.BTN_TOUCH in key_codes):
                 matches.append(device)
             else:
                 device.close()
+        except PermissionError:
+            denied_paths.append(path)
+            continue
         except OSError:
             continue
+    if not matches and denied_paths:
+        paths = ", ".join(denied_paths)
+        raise CalibrationError(
+            "permesso negato nell'accesso a dispositivi evdev (%s). "
+            "Accedere dalla sessione grafica locale affinché logind assegni l'ACL al suo utente; "
+            "non eseguire la GUI come root e non modificare i permessi del dispositivo" % paths
+        )
     if not matches:
         raise CalibrationError(f"nessun dispositivo evdev compatibile chiamato {DEVICE_NAME!r}")
     if len(matches) != 1:
@@ -288,19 +312,36 @@ def discover_device():
 
 
 class EvdevCapture:
-    """Capture one BTN_TOUCH press per displayed calibration target."""
+    """Threaded, explicitly-armed state machine for one touchscreen point.
 
-    def __init__(self, device, on_sample: Callable[[int, int], None], on_error: Callable[[str], None]):
-        from evdev import ecodes
+    ``IDLE`` and ``CAPTURED`` never become armed from a release event.  Only
+    :meth:`arm_point`, called by the GUI when it displays a target, may enter
+    ``ARMED``.  A pre-existing touch enters ``WAIT_RELEASE`` and must be
+    released before a later explicit arm can accept another touch.
+    """
+
+    IDLE = "idle"
+    WAIT_RELEASE = "wait-release"
+    ARMED = "armed"
+    PRESS_PENDING = "press-pending"
+    CAPTURED = "captured"
+    CLOSED = "closed"
+
+    def __init__(self, device, on_sample: Callable[[int, int, int], None], on_error: Callable[[str], None],
+                 ecodes_module=None, on_release_ready: Callable[[int], None] | None = None):
+        if ecodes_module is None:
+            from evdev import ecodes as ecodes_module
         self.device = device
-        self.ecodes = ecodes
+        self.ecodes = ecodes_module
         self.on_sample = on_sample
         self.on_error = on_error
-        self.current_x = 0
-        self.current_y = 0
+        self.on_release_ready = on_release_ready or (lambda _generation: None)
+        self.current_x = None
+        self.current_y = None
         self.touch_down = False
-        self.await_release = False
-        self.armed = False
+        self.state = self.IDLE
+        self.generation = 0
+        self.coordinates_after_press = False
         self.closed = threading.Event()
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self._run, name="nwfermi-evdev-capture", daemon=True)
@@ -308,46 +349,79 @@ class EvdevCapture:
     def start(self) -> None:
         self.thread.start()
 
-    def arm(self) -> None:
+    def arm_point(self) -> int:
+        """Explicitly arm the currently displayed target and return its token."""
         with self.lock:
-            self.armed = not self.touch_down
-            self.await_release = self.touch_down
+            if self.closed.is_set():
+                raise CalibrationError("acquisizione evdev già chiusa")
+            self.generation += 1
+            self.coordinates_after_press = False
+            self.state = self.WAIT_RELEASE if self.touch_down else self.ARMED
+            return self.generation
 
-    def retry(self) -> None:
-        self.arm()
+    def snapshot(self) -> tuple[str, int]:
+        with self.lock:
+            return self.state, self.generation
 
     def close(self) -> None:
         self.closed.set()
+        with self.lock:
+            self.state = self.CLOSED
         try:
             self.device.close()
         except OSError:
             pass
+
+    def process_event(self, event) -> None:
+        """Process one event; public to permit deterministic fake-device tests."""
+        sample = None
+        release_ready = None
+        with self.lock:
+            if self.state == self.CLOSED:
+                return
+            if event.type == self.ecodes.EV_ABS:
+                if event.code == self.ecodes.ABS_X:
+                    self.current_x = event.value
+                    if self.state == self.PRESS_PENDING:
+                        self.coordinates_after_press = True
+                elif event.code == self.ecodes.ABS_Y:
+                    self.current_y = event.value
+                    if self.state == self.PRESS_PENDING:
+                        self.coordinates_after_press = True
+            elif event.type == self.ecodes.EV_KEY and event.code == self.ecodes.BTN_TOUCH:
+                if event.value == 0:
+                    self.touch_down = False
+                    # Release is deliberately passive: it never re-arms.
+                    if self.state == self.WAIT_RELEASE:
+                        self.state = self.IDLE
+                        release_ready = self.generation
+                    elif self.state == self.PRESS_PENDING:
+                        self.state = self.IDLE
+                elif event.value:
+                    self.touch_down = True
+                    if self.state == self.ARMED:
+                        self.state = self.PRESS_PENDING
+                        self.coordinates_after_press = False
+            elif event.type == self.ecodes.EV_SYN and event.code == self.ecodes.SYN_REPORT:
+                if (self.state == self.PRESS_PENDING and self.coordinates_after_press
+                        and self.current_x is not None and self.current_y is not None):
+                    sample = (self.current_x, self.current_y, self.generation)
+                    self.state = self.CAPTURED
+        if sample is not None:
+            self.on_sample(*sample)
+        if release_ready is not None:
+            self.on_release_ready(release_ready)
 
     def _run(self) -> None:
         try:
             for event in self.device.read_loop():
                 if self.closed.is_set():
                     return
-                with self.lock:
-                    if event.type == self.ecodes.EV_ABS:
-                        if event.code == self.ecodes.ABS_X:
-                            self.current_x = event.value
-                        elif event.code == self.ecodes.ABS_Y:
-                            self.current_y = event.value
-                    elif event.type == self.ecodes.EV_KEY and event.code == self.ecodes.BTN_TOUCH:
-                        if event.value == 0:
-                            self.touch_down = False
-                            self.await_release = False
-                            self.armed = True
-                        elif event.value:
-                            self.touch_down = True
-                    elif event.type == self.ecodes.EV_SYN and event.code == self.ecodes.SYN_REPORT:
-                        if self.touch_down and self.armed and not self.await_release:
-                            self.armed = False
-                            self.await_release = True
-                            self.on_sample(self.current_x, self.current_y)
+                self.process_event(event)
         except OSError as error:
             if not self.closed.is_set():
+                with self.lock:
+                    self.state = self.CLOSED
                 self.on_error(f"lettura evdev interrotta: {error}")
 
 
@@ -382,7 +456,8 @@ def run_gtk_calibration(args: argparse.Namespace) -> int:
             self.capture = None
             self.samples: list[tuple[int, int]] = []
             self.point_index = 0
-            self.device_error = None
+            self.expected_generation = None
+            self.pending_matrix = None
 
         def do_activate(self):
             self.window = Gtk.ApplicationWindow(application=self, title="Calibrazione SMART Board")
@@ -405,8 +480,11 @@ def run_gtk_calibration(args: argparse.Namespace) -> int:
             key.connect("key-pressed", self.on_key)
             self.window.add_controller(key)
             self.window.present()
-            self.capture = EvdevCapture(device, lambda x, y: GLib.idle_add(self.got_sample, x, y),
-                                        lambda message: GLib.idle_add(self.capture_failed, message))
+            self.capture = EvdevCapture(device, lambda x, y, generation: GLib.idle_add(
+                self.got_sample, x, y, generation),
+                                        lambda message: GLib.idle_add(self.capture_failed, message),
+                                        on_release_ready=lambda generation: GLib.idle_add(
+                                            self.release_ready, generation))
             self.capture.start()
             GLib.idle_add(self.next_point)
 
@@ -414,10 +492,19 @@ def run_gtk_calibration(args: argparse.Namespace) -> int:
             if keyval == 0xff1b:  # Escape
                 self.quit()
                 return True
-            if keyval in (ord("r"), ord("R")) and self.point_index < 4:
+            if keyval in (ord("r"), ord("R")):
+                if self.pending_matrix is not None:
+                    self.pending_matrix = None
+                    self.samples = []
+                    self.point_index = 0
+                if self.point_index >= 4:
+                    return True
                 self.samples = self.samples[:self.point_index]
-                self.capture.retry()
+                self.arm_current_point()
                 self.status.set_label("Punto annullato. Toccare di nuovo la croce corrente.")
+                return True
+            if keyval == 0xff0d and self.pending_matrix is not None:
+                self.apply_matrix(self.pending_matrix)
                 return True
             return False
 
@@ -452,18 +539,33 @@ def run_gtk_calibration(args: argparse.Namespace) -> int:
                 f"Punto {self.point_index + 1}/4 ({labels[self.point_index]}). "
                 "Toccare e rilasciare la croce. R ripete il punto, Esc annulla."
             )
-            self.capture.arm()
+            self.arm_current_point()
             self.area.queue_draw()
             return False
 
-        def got_sample(self, x, y):
-            if self.point_index >= 4:
+        def arm_current_point(self):
+            self.pending_matrix = None
+            self.expected_generation = self.capture.arm_point()
+
+        def got_sample(self, x, y, generation):
+            if self.point_index >= 4 or generation != self.expected_generation:
                 return False
+            self.expected_generation = None
             self.samples.append((x, y))
             self.point_index += 1
             return self.next_point()
 
+        def release_ready(self, generation):
+            # The evdev thread only reports a release.  The GUI performs the
+            # explicit re-arm and rejects stale notifications from a retry.
+            if self.point_index < 4 and generation == self.expected_generation:
+                self.arm_current_point()
+                self.status.set_label("Toccare la croce corrente.")
+            return False
+
         def capture_failed(self, message):
+            self.expected_generation = None
+            self.pending_matrix = None
             self.status.set_label(message)
             return False
 
@@ -479,10 +581,10 @@ def run_gtk_calibration(args: argparse.Namespace) -> int:
                 if args.verify:
                     self.status.set_label(f"Verifica non eseguibile: {error}.")
                     return
-                self.status.set_label(f"Calibrazione rifiutata: {error}. Premere R per ripetere l'ultimo punto.")
+                self.status.set_label(f"Calibrazione rifiutata: {error}. Ripetere il quarto punto.")
                 self.point_index = 3
                 self.samples = self.samples[:3]
-                self.capture.retry()
+                self.arm_current_point()
                 self.area.queue_draw()
                 return
             matrix = format_matrix(result.matrix)
@@ -493,15 +595,17 @@ def run_gtk_calibration(args: argparse.Namespace) -> int:
                 prefix = "Verifica della matrice installata" if args.verify else "Calcolo preliminare"
                 self.status.set_label(f"{prefix}: {verdict}.\n{text}\nNessuna modifica applicata.")
                 return
-            self.status.set_label(text + "\nPremere Invio per applicare, Esc per annullare.")
-            key = Gtk.EventControllerKey()
-            key.connect("key-pressed", self.apply_key, result.matrix)
-            self.window.add_controller(key)
+            self.pending_matrix = result.matrix
+            self.status.set_label(text + "\nPremere Invio per applicare, R per ricominciare, Esc per annullare.")
 
-        def apply_key(self, _controller, keyval, _keycode, _state, matrix):
-            if keyval != 0xff0d:
-                return False
-            command = [sys.argv[0], "--install-rule", *format_matrix(matrix).split()]
+        def apply_matrix(self, matrix):
+            if self.pending_matrix != matrix:
+                return
+            self.pending_matrix = None
+            if not INSTALLED_COMMAND.is_file() or not os.access(INSTALLED_COMMAND, os.X_OK):
+                self.status.set_label("Applicazione non disponibile: installare il pacchetto nwfermi-daemon-service.")
+                return
+            command = [str(INSTALLED_COMMAND), "--install-rule", *format_matrix(matrix).split()]
             completed = subprocess.run(["pkexec", *command], text=True, capture_output=True)
             if completed.returncode:
                 self.status.set_label("Applicazione non riuscita: " + (completed.stderr.strip() or "autorizzazione negata"))
@@ -510,8 +614,6 @@ def run_gtk_calibration(args: argparse.Namespace) -> int:
                     "Regola udev salvata e ricaricata. Chiudere e riaprire la sessione GNOME per garantire "
                     "che libinput rilegga la calibrazione; non è stato riavviato alcun driver."
                 )
-            return True
-
         def do_shutdown(self):
             if self.capture:
                 self.capture.close()
@@ -555,7 +657,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             restore_rule()
             return 0
         if args.restore:
-            return subprocess.run(["pkexec", sys.argv[0], "--restore-rule"], check=False).returncode
+            if not INSTALLED_COMMAND.is_file() or not os.access(INSTALLED_COMMAND, os.X_OK):
+                raise CalibrationError("comando installato non disponibile; installare nwfermi-daemon-service")
+            return subprocess.run(["pkexec", str(INSTALLED_COMMAND), "--restore-rule"], check=False).returncode
         if args.simulate:
             points, x_axis, y_axis = load_simulation(args.simulate)
             source = [(x_axis.normalize(x), y_axis.normalize(y)) for x, y in points]
